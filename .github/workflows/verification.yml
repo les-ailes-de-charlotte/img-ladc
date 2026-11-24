@@ -1,0 +1,68 @@
+# Contrôle de chaque proposition (pull request) vers main.
+# Refuse toute modification, renommage ou suppression d'un fichier déjà publié
+# (sauf README.md), et vérifie le nom et le poids des images ajoutées.
+# pull_request_target : c'est la version de ce fichier sur main qui s'exécute,
+# une proposition ne peut donc pas désactiver le contrôle. Aucun code de la
+# proposition n'est exécuté : on lit seulement la liste des fichiers.
+name: Vérification des images
+
+on:
+  pull_request_target:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  verification:
+    name: verification
+    runs-on: ubuntu-latest
+    steps:
+      - name: Récupérer le dépôt
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Contrôler les fichiers de la proposition
+        env:
+          BASE: ${{ github.event.pull_request.base.sha }}
+          PR: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          git fetch --no-tags origin "pull/${PR}/head:proposition"
+          depart=$(git merge-base "$BASE" proposition)
+          erreurs=0
+
+          # 1. Aucun fichier publié ne change ni ne disparaît (README.md excepté).
+          while IFS= read -r -d '' statut && IFS= read -r -d '' chemin; do
+            [ "$statut" = "A" ] && continue
+            [ "$chemin" = "README.md" ] && continue
+            echo "::error file=${chemin}::« ${chemin} » est déjà publié : il ne peut être ni modifié, ni renommé, ni supprimé. Ajoutez plutôt une nouvelle version sous un nouveau nom (par exemple -v2)."
+            erreurs=1
+          done < <(git diff -z --no-renames --name-status "$depart" proposition)
+
+          # 2. Les fichiers ajoutés : images seulement, nom propre, poids raisonnable.
+          while IFS= read -r -d '' chemin; do
+            case "$chemin" in
+              .github/*)
+                echo "::error file=${chemin}::Le dossier .github est réservé au DSI."
+                erreurs=1; continue ;;
+            esac
+            nom=$(basename "$chemin")
+            if ! [[ "$nom" =~ ^[a-z0-9][a-z0-9_-]*\.(png|jpg|jpeg|gif)$ ]]; then
+              echo "::error file=${chemin}::Nom refusé : « ${nom} ». Image PNG, JPG ou GIF, nom en minuscules, sans accent ni espace (lettres, chiffres, - et _)."
+              erreurs=1
+            fi
+            taille=$(git cat-file -s "proposition:${chemin}")
+            if [ "$taille" -gt 512000 ]; then
+              echo "::error file=${chemin}::« ${nom} » pèse $((taille / 1024)) Ko : 500 Ko au plus. Réduisez l'image à sa taille d'affichage."
+              erreurs=1
+            fi
+          done < <(git diff -z --no-renames --name-only --diff-filter=A "$depart" proposition)
+
+          if [ "$erreurs" -ne 0 ]; then
+            echo "Proposition refusée : voir les messages ci-dessus."
+            exit 1
+          fi
+          echo "Tout est bon : la proposition peut être fusionnée."
